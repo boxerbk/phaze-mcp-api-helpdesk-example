@@ -1,6 +1,6 @@
 # Phaze API + MCP example: an AI helpdesk agent
 
-This was 100% AI vibe coded with Opus 5.5. I made this to share an example of what someone can do with the Phaze API and MCP server. I hope this inspires ideas.
+This was 100% AI vibe coded with Opus 5.5. This example is not meant to be used for anything other than to teach you or an AI agent how to implement the Phaze API and MCP for a common IT use case. I hope this inspires ideas.
 
 **Please note:** Phaze currently only supports a connection between a *Windows computer and another Windows computer*. It uses accelerated graphics, so this will not work on PCs without graphics capabilities (either via your integrated CPU graphics or your discrete GPU). Almost all CPUs support this other than server-class CPUs.
 
