@@ -187,9 +187,9 @@ async def test_run_orchestration():
 
 async def test_machine_picker():
     r, ph = mk()
-    r.allowed_machines = {"a": "Martin Tower", "b": "Martin Tower", "c": "BB-Desktop", "d": "Laptop"}
-    assert r._match_machine("3") == "c" and r._match_machine("bb-desktop") == "c"
-    assert r._match_machine("lap") == "d" and r._match_machine("martin") is None   # ambiguous name
+    r.allowed_machines = {"a": "Office Tower", "b": "Office Tower", "c": "Studio-PC", "d": "Laptop"}
+    assert r._match_machine("3") == "c" and r._match_machine("studio-pc") == "c"
+    assert r._match_machine("lap") == "d" and r._match_machine("office") is None   # ambiguous name
     assert r._match_machine("9") is None and r._match_machine("") is None
     # requester signals are ignored while waiting on a technician
     r.inbox.put_nowait(Signal("requester", "close", "UREQ")); r.inbox.put_nowait(Signal("reply", "HP", "U7"))
@@ -198,8 +198,8 @@ async def test_machine_picker():
     t = asyncio.create_task(r._wait_machine_pick())
     r.inbox.put_nowait(Signal("requester", "the tower", "UREQ")); r.inbox.put_nowait(Signal("requester", "2", "UREQ"))
     mid, sig = await asyncio.wait_for(t, 2)
-    assert mid == "b" and sig is None and r.allowed_machines == {"b": "Martin Tower"}
-    assert any(p[0] == "requester_hint" for p in r.slack.posts) and ("machine_chosen", "Martin Tower") in r.slack.posts
+    assert mid == "b" and sig is None and r.allowed_machines == {"b": "Office Tower"}
+    assert any(p[0] == "requester_hint" for p in r.slack.posts) and ("machine_chosen", "Office Tower") in r.slack.posts
     # a button click with a machine id that isn't theirs is ignored; a tech takeover ends the wait
     r.allowed_machines = {"a": "A", "c": "C"}
     t = asyncio.create_task(r._wait_machine_pick())
