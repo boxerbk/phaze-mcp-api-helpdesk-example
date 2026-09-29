@@ -1,6 +1,6 @@
 # Phaze API + MCP example: an AI helpdesk agent
 
-This was 100% AI vibe coded. I made this to share an example of what someone can do with the Phaze API and MCP server. I hope this inspires ideas.
+This was 100% AI vibe coded with Opus 5.5. I made this to share an example of what someone can do with the Phaze API and MCP server. I hope this inspires ideas.
 
 
 This repo is a working example of what you can build with the **Phaze Enterprise API** and
