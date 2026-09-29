@@ -58,8 +58,11 @@ the **MCP** to actually *do* something on it.
 ## Part 1: The Phaze Enterprise API
 
 ### Get an API key
-
-Phaze is currently in beta, so we don't have a web sign up for the administrator system. First, visit https://web.phaze.app/signup to create your account. Then email founders@phaze.app from the email address that you created your account with. We will create an administrator account for you.
+> [!NOTE]
+> Phaze is currently in beta, so we don't have a web sign up for the administrator system. 
+> 1. visit https://web.phaze.app/signup to create your account.
+> 2. Then email founders@phaze.app from the email address that you created your account with.
+> 3. We will create an administrator account for you.
 
 API keys are created in the Phaze admin portal, which needs an **administrator account**
 at **[admin.phaze.app](https://admin.phaze.app)**. If you're not an admin, ask your Phaze
