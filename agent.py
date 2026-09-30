@@ -48,6 +48,13 @@ CLAUDE_CODE_BUILTINS = [
     "WebSearch", "Task", "NotebookEdit", "TodoWrite", "BashOutput", "KillShell",
 ]
 POLL_SECONDS = 5
+CAPTURE_WARMUP_SECONDS = 8    # "output is not ready" right after connecting clears within seconds
+CAPTURE_POLL_SECONDS = 2
+SIGNIN_POLL_SECONDS = 5
+SIGNIN_SCREEN_ERROR = "not capturing"  # what phaze_screenshot says on the Windows sign-in/lock screen
+# Shown at the top of a handoff page when a password is what's blocking the agent.
+SIGNIN_BLOCKER = "the computer is at the Windows sign-in / lock screen, and someone has to sign in."
+PASSWORD_PROMPT_BLOCKER = "the agent stopped at a password, PIN, MFA, or admin (UAC) prompt."
 
 
 def _text(s: str) -> dict:
@@ -83,6 +90,8 @@ class HelpdeskRun:
         self.machine_id: str | None = None
         self.connection_id: str | None = None
         self.preexisting: set[str] = set()           # connections open before this run; never closed by it
+        self.capturing: set[str] = set()             # connections known to return screenshots
+        self.password_blocker: str | None = None     # set while a password is what's blocking the agent
         self.outcome = "unfinished"
         self.pending: tuple[str, str] | None = None  # ("ask" | "handoff", text) from the agent
         self.interrupted_by: Signal | None = None    # a tech signal that stopped the agent mid-turn
@@ -152,11 +161,15 @@ class HelpdeskRun:
 
         @tool("request_handoff",
               "Hand the live session to a human technician. The system pages them, gives them "
-              "control when they join, and resumes you if they hand back. End your turn right after.",
-              {"summary": str})
+              "control when they join, and resumes you if they hand back. Set password_required "
+              "when you stopped because a password, PIN, MFA code, admin (UAC) prompt, or lock "
+              "screen is in the way. End your turn right after.",
+              {"summary": str, "password_required": bool})
         async def request_handoff(args):
             if run.pending:
                 return _text("Already waiting on a technician. End your turn now.")
+            if args.get("password_required"):
+                run.password_blocker = PASSWORD_PROMPT_BLOCKER
             run.pending = ("handoff", args["summary"])
             return _text("Handoff requested. Stop sending input and end your turn now.")
 
@@ -212,6 +225,11 @@ class HelpdeskRun:
             return _deny("That connection is to a machine not assigned to the requester.")
         self.connection_id = conn["connection_id"]
 
+        if t == "phaze_screenshot":
+            problem = await self._ensure_capturing(conn)
+            if problem:
+                return _deny(problem)
+
         if t == "phaze_set_control":
             target = int(args.get("guest_id", 0))
             me, holder = self_guest(conn), controller(conn)
@@ -224,6 +242,69 @@ class HelpdeskRun:
             elif target != 0:
                 return _deny("Only the system hands control to technicians. Use request_handoff.")
         return {}
+
+    # ---------- screen capture ----------
+    async def _capture_error(self, connection_id: str) -> str | None:
+        """Try one real screenshot; None if it worked, else the error text."""
+        try:
+            await self.phaze.call("phaze_screenshot", connection_id=connection_id)
+            self.capturing.add(connection_id)
+            return None
+        except PhazeMCPError as e:
+            return str(e)
+
+    async def _ensure_capturing(self, conn: dict) -> str | None:
+        """Before the agent's first screenshot on a connection, check the screen can actually
+        be captured. Returns a message for the agent when it shouldn't proceed, else None.
+
+        - "output is not ready": the first frame hasn't arrived; wait a few seconds.
+        - "connection is not capturing": the machine is on the Windows sign-in / lock screen
+          (a secure desktop Phaze doesn't capture). Only a person can sign in, so ask the
+          requester and let the run loop resume the agent once the screen is visible.
+        """
+        cid = conn["connection_id"]
+        if cid in self.capturing:
+            return None
+        error, deadline = None, time.monotonic() + CAPTURE_WARMUP_SECONDS
+        while (error := await self._capture_error(cid)) and time.monotonic() < deadline:
+            await asyncio.sleep(CAPTURE_POLL_SECONDS)
+        if not error:
+            return None
+        if SIGNIN_SCREEN_ERROR in error:
+            self.pending = ("signin", cid)
+            self.log("[phaze] screen not capturing: machine is likely at the sign-in screen")
+            machine = self.allowed_machines.get(self.machine_id or "", "your computer")
+            self.password_blocker = SIGNIN_BLOCKER
+            await asyncio.to_thread(self.slack.ask_requester_sign_in, self.ticket, machine)
+            await self._post("announce",
+                             f":lock: *Stopped at the Windows sign-in / lock screen: a password is "
+                             f"needed.* {machine} can't be seen or used until someone signs in. The "
+                             f"agent asked the requester to sign in and will continue automatically "
+                             f"once the screen is visible.")
+            return ("The computer is at the Windows sign-in or lock screen, which Phaze can't capture, "
+                    "and you must never type a password. The system has asked the requester to sign "
+                    "in and will message you when the screen is visible. End your turn now.")
+        return (f"Screenshots on this connection fail ({error}). Use request_handoff and say so.")
+
+    async def _wait_signed_in(self, connection_id: str) -> tuple[bool, Signal | None]:
+        """Wait for the requester to sign in: poll a screenshot until it works. Returns
+        (True, None) once the screen is visible, (False, tech signal) if a tech stepped in,
+        or (False, None) on timeout."""
+        deadline = time.monotonic() + self.cfg.human_reply_timeout_min * 60
+        while time.monotonic() < deadline:
+            sig = await self._wait_signal(SIGNIN_POLL_SECONDS)
+            if sig and sig.kind in ("takeover", "resolved", "close"):
+                return False, sig
+            if sig:
+                await self._note("Waiting for the requester to sign in. Reply `takeover` to step in.")
+            if not await self._capture_error(connection_id):
+                self.password_blocker = None
+                await asyncio.to_thread(self.slack.requester_signed_in, self.ticket, True)
+                await self._note(":unlock: Signed in; the screen is visible again and the agent is continuing.")
+                self.log("[phaze] screen visible again; requester signed in")
+                return True, None
+        await asyncio.to_thread(self.slack.requester_signed_in, self.ticket, False)
+        return False, None
 
     def options(self) -> ClaudeAgentOptions:
         helpdesk = create_sdk_mcp_server(name="helpdesk", version="0.2.0", tools=self._tools())
@@ -245,7 +326,8 @@ class HelpdeskRun:
             disallowed_tools=disallowed,
             max_turns=self.cfg.max_turns,
             max_buffer_size=32 * 1024 * 1024,  # screenshots exceed the SDK's 1 MB default
-            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[self._guard])]},
+            # Headroom for the guard's screen-capture check before a first screenshot.
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[self._guard], timeout=120)]},
         )
 
     # ---------- the agent's turn ----------
@@ -342,6 +424,21 @@ class HelpdeskRun:
                                    if sig else
                                    f"The requester didn't pick a machine within {self.cfg.human_reply_timeout_min} "
                                    f"min. Their machines: {', '.join(self.allowed_machines.values())}.")
+
+                    if request[0] == "signin":
+                        ok, sig = await self._wait_signed_in(request[1])
+                        if ok:
+                            prompt = ("The requester signed in and the screen is visible now. Take a "
+                                      "screenshot and continue the ticket.")
+                            continue
+                        if sig and sig.kind in ("resolved", "close"):
+                            await self._finish_by_tech(sig)
+                            break
+                        request = ("handoff",
+                                   f"{await self._who(sig)} took over while the machine was at the sign-in screen."
+                                   if sig else
+                                   f"The machine stayed at the Windows sign-in screen for "
+                                   f"{self.cfg.human_reply_timeout_min} min; the requester didn't sign in.")
 
                     if request[0] == "ask":
                         sig = await self._wait_signal(self.cfg.human_reply_timeout_min * 60)
@@ -485,8 +582,11 @@ class HelpdeskRun:
                 "give control to the agent's guest in Phaze), *Mark resolved*, or *Close*."
                 if allow_handback else
                 "Handback limit reached for this ticket: please finish it, then *Mark resolved* or *Close*.")
+        needs_password = (f":lock: *Needs a password:* {self.password_blocker}\n"
+                          if self.password_blocker else "")
         await asyncio.to_thread(self.slack.escalate, self.ticket,
                                 f"<!here> :rotating_light: *Helpdesk agent needs a human*\n"
+                                f"{needs_password}"
                                 f"*Ticket:* <{self.ticket.url}|{self.ticket.subject or self.ticket.id}>\n"
                                 f"*Requester:* {self.ticket.requester_name} ({self.ticket.requester_email})\n"
                                 f"{where}\n\n{summary}\n\n{back}", machine_id)
@@ -545,6 +645,7 @@ class HelpdeskRun:
         """Retake control after a handback and build the agent's next prompt."""
         who = await self._who(sig)
         self.outcome = "unfinished"
+        self.password_blocker = None  # the technician dealt with it (or will say otherwise)
         conn = await self._my_connection()
         state = "You have no open session; reconnect as in your workflow."
         if conn and self.observe_only:

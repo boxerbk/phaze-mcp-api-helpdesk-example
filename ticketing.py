@@ -181,6 +181,22 @@ class Slack:
                    blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}])
         self.picker_ts = None
 
+    def ask_requester_sign_in(self, ticket: Ticket, machine: str) -> None:
+        """The machine is at the Windows sign-in / lock screen, which can't be captured."""
+        r = self._call("chat.postMessage", channel=ticket.channel, thread_ts=ticket.ts,
+                       text=f"<@{ticket.requester_slack_id}> *{machine}* is at the Windows sign-in "
+                            f"screen, so I can't see it yet. Please sign in (or unlock it), and I'll "
+                            f"pick up from there automatically. I never need your password.")
+        self.signin_ts = r["ts"]
+
+    def requester_signed_in(self, ticket: Ticket, ok: bool) -> None:
+        if not getattr(self, "signin_ts", None):
+            return
+        text = ("Thanks, I can see the screen now and I'm working on it." if ok else
+                "I still couldn't see the screen, so a technician will follow up.")
+        self._call("chat.update", channel=ticket.channel, ts=self.signin_ts, text=text)
+        self.signin_ts = None
+
     # ---- tech-only thread ----
     def open_thread(self, ticket: Ticket) -> None:
         """Create the escalation-channel thread up front; fails fast on a bad channel."""
@@ -193,6 +209,11 @@ class Slack:
     def add_internal_note(self, ticket: Ticket, note: str) -> None:
         self._call("chat.postMessage", channel=self.escalation_channel,
                    thread_ts=self.thread_ts, text=note)
+
+    def announce(self, ticket: Ticket, text: str) -> None:
+        """A thread note that is also shown in the channel, for things techs should notice."""
+        self._call("chat.postMessage", channel=self.escalation_channel,
+                   thread_ts=self.thread_ts, text=text, reply_broadcast=True)
 
     def ask(self, ticket: Ticket, text: str) -> None:
         """A question for a technician; the agent keeps the session while it waits."""
@@ -235,6 +256,9 @@ class DryRunSlack(Slack):
     def ask(self, ticket, text):
         print(f"\n[dry-run] QUESTION FOR TECH\n{text}\n")
 
+    def announce(self, ticket, text):
+        print(f"\n[dry-run] ANNOUNCE (thread + channel)\n{text}\n")
+
     def ask_requester_machine(self, ticket, machines):
         print("\n[dry-run] REQUESTER THREAD: Which computer is it on?")
         for i, (_, name, online) in enumerate(machines, 1):
@@ -243,6 +267,12 @@ class DryRunSlack(Slack):
 
     def requester_hint(self, ticket, count):
         print(f"[dry-run] REQUESTER THREAD: reply with a number from 1 to {count}")
+
+    def ask_requester_sign_in(self, ticket, machine):
+        print(f"\n[dry-run] REQUESTER THREAD: {machine} is at the sign-in screen; please sign in\n")
+
+    def requester_signed_in(self, ticket, ok):
+        print(f"[dry-run] REQUESTER THREAD: {'screen visible, working on it' if ok else 'still not visible; a tech will follow up'}")
 
     def machine_chosen(self, ticket, name):
         print(f"[dry-run] REQUESTER THREAD: {'connecting to ' + name if name else 'a technician is taking over'}")

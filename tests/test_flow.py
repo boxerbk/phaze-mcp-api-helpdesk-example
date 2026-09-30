@@ -15,6 +15,9 @@ from agent import HelpdeskRun
 from ticketing import Ticket, Signal, parse_command
 
 agent.POLL_SECONDS = 0.02
+agent.CAPTURE_POLL_SECONDS = 0.01
+agent.CAPTURE_WARMUP_SECONDS = 0.05
+agent.SIGNIN_POLL_SECONDS = 0.01
 
 # ---- parse_command ----
 cases = {"back try restarting the spooler": ("handback", "try restarting the spooler"),
@@ -47,6 +50,8 @@ class FakePhaze:
         for g in self.guests: g["has_control"] = (g["guest_id"] == gid)
     async def disconnect(self, cid):
         self.calls.append(("disconnect", cid)); self.connected = False
+    async def call(self, name, **a):
+        return {}   # screenshots succeed immediately in the basic fake
 
 class FakeAPI:
     def find_member(self, e): return {"id": REQ}
@@ -56,7 +61,7 @@ class FakeAPI:
 class FakeSlack:
     def __init__(self): self.posts = []
     def __getattr__(self, name):
-        if name in ("add_internal_note", "ask", "escalate", "ask_requester_machine", "requester_hint", "machine_chosen"):
+        if name in ("add_internal_note", "ask", "escalate", "ask_requester_machine", "requester_hint", "machine_chosen", "ask_requester_sign_in", "requester_signed_in", "announce"):
             return lambda t, text=None, *rest: self.posts.append((name, text, *rest))
         raise AttributeError(name)
     def user_label(self, u): return f"Slack<{u}>"
@@ -143,6 +148,94 @@ async def test_solo_demo_same_account():
     await ph.set_control("c1", SELF)   # hand back inside Phaze
     sig = await asyncio.wait_for(task, 2); assert sig.kind == "handback"
     print("solo demo (same account) ok")
+
+class CapPhaze(FakePhaze):
+    """Screenshots fail with a given error for the first N calls per connection."""
+    def __init__(self, fails: dict):
+        super().__init__(); self.fails = dict(fails)
+    async def call(self, name, **a):
+        self.calls.append((name, a.get("connection_id")))
+        if name == "phaze_screenshot":
+            n, err = self.fails.get(a["connection_id"], (0, ""))
+            if n > 0:
+                self.fails[a["connection_id"]] = (n - 1, err)
+                from phaze_mcp import PhazeMCPError
+                raise PhazeMCPError(f"phaze_screenshot: {err}")
+        return {}
+
+async def test_screen_capture():
+    shot = pre("phaze_screenshot", connection_id="c1")
+    reason = lambda res: res["hookSpecificOutput"]["permissionDecisionReason"]
+    # warm-up: "output is not ready" twice, then frames arrive; the agent's screenshot goes through
+    r, _ = mk(); r.phaze = ph = CapPhaze({"c1": (2, "output is not ready")})
+    r.allowed_machines = {"m1": "demo"}; r.machine_id = "m1"
+    assert not denied(await r._guard(shot, None, None)) and "c1" in r.capturing
+    assert not denied(await r._guard(shot, None, None))              # checked once per connection
+    assert sum(1 for c in ph.calls if c[0] == "phaze_screenshot") == 3
+    # sign-in screen: requester is asked to sign in, agent is told to end its turn, no reconnect
+    r, _ = mk(); r.phaze = ph = CapPhaze({"c1": (10**6, "connection is not capturing: c1")})
+    r.allowed_machines = {"m1": "demo"}; r.machine_id = "m1"
+    res = await r._guard(shot, None, None)
+    assert denied(res) and "sign-in" in reason(res) and r.pending == ("signin", "c1")
+    assert r.slack.posts[0] == ("ask_requester_sign_in", "demo")
+    notice = next(p[1] for p in r.slack.posts if p[0] == "announce")   # visible in the escalation channel
+    assert ":lock:" in notice and "password is needed" in notice and "sign-in" in notice
+    # if nobody signs in, the handoff page leads with the password line
+    task = asyncio.create_task(r._handoff("stayed locked", allow_handback=True)); await asyncio.sleep(0.05)
+    page = [p for p in r.slack.posts if p[0] == "escalate"][-1][1]
+    assert page.splitlines()[1].startswith(":lock: *Needs a password:*") and "sign-in / lock screen" in page, page
+    r.inbox.put_nowait(Signal("close", "", "U7")); await asyncio.wait_for(task, 2); r.pending = ("signin", "c1")
+    assert not any(c[0] in ("phaze_connect", "disconnect") for c in ph.calls)
+    assert denied(await r._guard(pre("phaze_status"), None, None))   # everything blocked until resumed
+    # requester signs in after a few polls -> screen visible -> resumed
+    ph.fails["c1"] = (2, "connection is not capturing")
+    ok, sig = await asyncio.wait_for(r._wait_signed_in("c1"), 2)
+    assert ok and sig is None and ("requester_signed_in", True) in r.slack.posts
+    # a technician can step in while waiting
+    ph.fails["c1"] = (10**6, "connection is not capturing")
+    t = asyncio.create_task(r._wait_signed_in("c1")); r.inbox.put_nowait(Signal("takeover", "", "U7"))
+    ok, sig = await asyncio.wait_for(t, 2); assert not ok and sig.kind == "takeover"
+    # some other screenshot error: hand off rather than wait
+    r, _ = mk(); r.phaze = CapPhaze({"c1": (10**6, "boom")}); r.allowed_machines = {"m1": "demo"}
+    assert "request_handoff" in reason(await r._guard(shot, None, None))
+    # agent stops at a UAC / password prompt mid-task -> page says a password is needed
+    r, _ = mk(); tools = {tl.name: tl for tl in r._tools()}
+    await tools["request_handoff"].handler({"summary": "UAC prompt for driver install", "password_required": True})
+    task = asyncio.create_task(r._handoff(r.pending[1], allow_handback=True)); await asyncio.sleep(0.05)
+    page = [p for p in r.slack.posts if p[0] == "escalate"][-1][1]
+    assert ":lock: *Needs a password:*" in page and "UAC" in page, page
+    r.inbox.put_nowait(Signal("close", "", "U7")); await asyncio.wait_for(task, 2)
+    # without the flag, no password line
+    r, _ = mk(); tools = {tl.name: tl for tl in r._tools()}
+    await tools["request_handoff"].handler({"summary": "stuck", "password_required": False})
+    task = asyncio.create_task(r._handoff(r.pending[1], allow_handback=True)); await asyncio.sleep(0.05)
+    assert ":lock:" not in [p for p in r.slack.posts if p[0] == "escalate"][-1][1]
+    r.inbox.put_nowait(Signal("close", "", "U7")); await asyncio.wait_for(task, 2)
+    print("screen capture: warm-up, sign-in screen, resume, password notices ok")
+
+async def test_run_with_signin_pause():
+    class DummyClient:
+        def __init__(self, options): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+    agent.ClaudeSDKClient = DummyClient
+    r, ph = mk(); ph.connected = False; r.options = lambda: None
+    r.phaze = cp = CapPhaze({}); cp.connected = False
+    r.allowed_machines = {"m1": "demo"}; r.machine_id = "m1"
+    steps = iter(["locked", "resolve"]); prompts = []
+    async def fake_converse(client, prompt, first):
+        prompts.append(prompt); r.pending = None; cp.connected = True
+        if next(steps) == "locked":
+            cp.fails["c1"] = (10**6, "connection is not capturing")   # locked...
+            await r._guard(pre("phaze_screenshot", connection_id="c1"), None, None)
+            assert r.pending == ("signin", "c1")
+            cp.fails["c1"] = (3, "connection is not capturing")       # ...signs in after ~3 polls
+        else:
+            r.outcome = "resolved"
+    r._converse = fake_converse
+    assert await asyncio.wait_for(r.run(), 5) == "resolved"
+    assert "signed in" in prompts[1], prompts
+    print("run with sign-in pause ok")
 
 async def test_join_timeout():
     r, ph = mk(); r.machine_id = "m1"; r.allowed_machines = {"m1": "demo"}
@@ -238,5 +331,5 @@ async def test_run_with_picker():
 async def main():
     await test_machine_picker(); await test_run_with_picker()
     await test_guards(); await test_handoff_then_phaze_handback()
-    await test_slack_handback_and_resolve(); await test_solo_demo_same_account(); await test_join_timeout(); await test_run_orchestration()
+    await test_slack_handback_and_resolve(); await test_solo_demo_same_account(); await test_screen_capture(); await test_run_with_signin_pause(); await test_join_timeout(); await test_run_orchestration()
 asyncio.run(main())
